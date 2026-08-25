@@ -1515,6 +1515,10 @@ impl RequestForwarder {
         let mut codex_anthropic_one_m = false;
 
         // 转换请求体（如果需要）
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+            self.apply_media_prevention(&mut mapped_body, provider);
+        }
+
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -5156,6 +5160,84 @@ mod tests {
             "显式 text-only 即使关闭 heuristic 也应预替换"
         );
         assert_eq!(declared_body["messages"][0]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn prevention_replaces_codex_tool_output_images_for_text_only_models() {
+        let fwd = forwarder_with_rectifier(RectifierConfig::default());
+        let provider = provider_with_settings(json!({
+            "models": [ { "id": "deepseek-chat", "input": ["text"] } ]
+        }));
+
+        let mut body = body_with_codex_tool_output_image(false);
+        body["model"] = json!("deepseek-chat");
+
+        let replaced = fwd.apply_media_prevention(&mut body, &provider);
+        assert_eq!(replaced, 1);
+
+        let output = &body["input"][0]["output"];
+        assert_eq!(
+            output["content"][0]["text"],
+            crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
+        );
+    }
+
+    #[test]
+    fn prevention_end_to_end_avoids_synthetic_user_message_for_text_only_codex_tool() {
+        let fwd = forwarder_with_rectifier(RectifierConfig::default());
+        let provider = provider_with_settings(json!({
+            "models": [ { "id": "kimi-k3", "input": ["text"] } ]
+        }));
+
+        let mut body = json!({
+            "model": "kimi-k3",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect screen"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "tool_call_1",
+                    "name": "view_image",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "tool_call_1",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,YWJj"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        // Pre-sanitization before transform
+        let replaced = fwd.apply_media_prevention(&mut body, &provider);
+        assert_eq!(replaced, 1);
+
+        // Convert to Chat Completions
+        let chat =
+            super::super::providers::transform_codex_chat::responses_to_chat_completions(body)
+                .unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+
+        // Exactly 3 messages: user -> assistant (tool_calls) -> tool
+        // NO synthetic trailing user message that breaks strict Chat Completions tool turn sequence!
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "tool_call_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "tool_call_1");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains(crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER));
     }
 
     #[test]
