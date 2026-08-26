@@ -334,24 +334,49 @@ pub fn atomic_write_private(path: &Path, data: &[u8]) -> Result<(), AppError> {
 }
 
 /// Resolve symlink target so atomic writes update the real file and preserve the link.
+/// Also resolves dangling symlinks where the target file does not yet exist.
 fn resolve_symlink_target(path: &Path) -> PathBuf {
-    match fs::canonicalize(path) {
-        Ok(canonical) => {
-            #[cfg(windows)]
-            {
-                // Normalize Windows \\?\UNC\server\share or \\?\C:\... to standard paths
-                let s = canonical.to_string_lossy();
-                if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
-                    return PathBuf::from(format!(r"\\{stripped}"));
+    let mut current = path.to_path_buf();
+    for _ in 0..16 {
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => match fs::read_link(&current) {
+                Ok(target) => {
+                    current = if target.is_absolute() {
+                        target
+                    } else {
+                        current
+                            .parent()
+                            .map(|parent| parent.join(&target))
+                            .unwrap_or(target)
+                    };
                 }
-                if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                    return PathBuf::from(stripped);
-                }
-            }
-            canonical
+                Err(_) => break,
+            },
+            _ => break,
         }
-        Err(_) => path.to_path_buf(),
     }
+
+    match fs::canonicalize(&current) {
+        Ok(canonical) => normalize_windows_verbatim_path(canonical),
+        Err(_) => current,
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{stripped}"));
+    }
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn atomic_write_with_unix_mode(
@@ -590,6 +615,33 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"updated target contents");
 
         // Verify that `link` remains a symlink and is not converted to a regular file
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink());
+    }
+
+    #[test]
+    fn atomic_write_creates_dangling_symlink_target_and_preserves_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub").join("non_existent_target.json");
+        let link = dir.path().join("dangling_link.json");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+                // Windows non-admin or without developer mode enabled might return PrivilegeNotHeld.
+                return;
+            }
+        }
+
+        atomic_write(&link, b"created target contents").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"created target contents");
+        assert_eq!(std::fs::read(&link).unwrap(), b"created target contents");
+
         let meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink());
     }
