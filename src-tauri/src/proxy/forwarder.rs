@@ -5240,12 +5240,11 @@ mod tests {
     #[test]
     fn prevention_resolves_upstream_model_substitution_before_transform() {
         let fwd = forwarder_with_rectifier(RectifierConfig::default());
-        let mut provider = provider_with_settings(json!({
+        let provider = provider_with_settings(json!({
+            "api_format": "chat",
+            "model": "deepseek-v4-flash",
             "models": [ { "id": "deepseek-v4-flash", "input": ["text"] } ]
         }));
-        if let Some(meta) = provider.meta.as_mut() {
-            meta.model = Some("deepseek-v4-flash".to_string());
-        }
 
         let mut body = json!({
             "model": "gpt-4o",
