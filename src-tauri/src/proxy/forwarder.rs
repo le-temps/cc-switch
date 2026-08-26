@@ -1514,11 +1514,6 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
-        // 转换请求体（如果需要）
-        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
-            self.apply_media_prevention(&mut mapped_body, provider);
-        }
-
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -1535,6 +1530,7 @@ impl RequestForwarder {
                 );
             }
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            self.apply_media_prevention(&mut mapped_body, provider);
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -1552,6 +1548,7 @@ impl RequestForwarder {
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            self.apply_media_prevention(&mut mapped_body, provider);
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
             // configured on the provider here — it takes precedence over any
@@ -5238,6 +5235,60 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(crate::proxy::media_sanitizer::UNSUPPORTED_IMAGE_MARKER));
+    }
+
+    #[test]
+    fn prevention_resolves_upstream_model_substitution_before_transform() {
+        let fwd = forwarder_with_rectifier(RectifierConfig::default());
+        let mut provider = provider_with_settings(json!({
+            "models": [ { "id": "deepseek-v4-flash", "input": ["text"] } ]
+        }));
+        if let Some(meta) = provider.meta.as_mut() {
+            meta.model = Some("deepseek-v4-flash".to_string());
+        }
+
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect screen"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "tool_call_1",
+                    "name": "view_image",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "tool_call_1",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,YWJj"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        super::super::providers::apply_codex_chat_upstream_model(&provider, &mut body);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+
+        let replaced = fwd.apply_media_prevention(&mut body, &provider);
+        assert_eq!(replaced, 1);
+
+        let chat =
+            super::super::providers::transform_codex_chat::responses_to_chat_completions(body)
+                .unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "tool_call_1");
     }
 
     #[test]
